@@ -255,7 +255,7 @@ DefinitionBlock ("", "SSDT", 2, "CORP ", "SsdtEC", 0x00001000)
         else:
             print(" - Found {}".format(cpu_name))
         print("Determining CPU parent name scheme...")
-        cpu_p_name = next((x for x in ("_PR_","_SB_") if "{}.{}".format(x,cpu_name) in self.d.dsdt),None)
+        cpu_p_name = next((x for x in ("_PR_","_SB_","_PR") if "{}.{}".format(x,cpu_name) in self.d.dsdt),None)
         if not cpu_p_name:
             print(" - Could not locate {} parent! Aborting!".format(cpu_name))
             print("")
