@@ -11,7 +11,7 @@ class DSDT:
         self.u    = utils.Utils("SSDT Time")
         self.iasl_url_macOS = "https://bitbucket.org/RehabMan/acpica/downloads/iasl.zip"
         self.iasl_url_linux = "http://amdosx.kellynet.nl/iasl.zip"
-        self.iasl_url_windows = "https://acpica.org/sites/acpica/files/iasl-win-20180105.zip"
+        self.iasl_url_windows = "https://acpica.org/sites/acpica/files/iasl-win-20200528.zip"
         self.iasl = self.check_iasl()
         if not self.iasl:
             raise Exception("Could not locate or download iasl!")
@@ -90,7 +90,7 @@ class DSDT:
             try:
                 if sys.platform == "darwin":
                     self._download_and_extract(temp,self.iasl_url_macOS)
-                elif sys.platform == "linux":
+                elif sys.platform.startswith("linux"):
                     self._download_and_extract(temp,self.iasl_url_linux)
                 elif sys.platform == "win32":
                     self._download_and_extract(temp,self.iasl_url_windows)
@@ -134,7 +134,7 @@ class DSDT:
         self.u.head("Dumping DSDT")
         print("")
         res = self.check_output(output)
-        if sys.platform == "linux":
+        if sys.platform.startswith("linux"):
             print("Checking if DSDT exists")
             e = "/sys/firmware/acpi/tables/DSDT"
             dsdt_path = os.path.join(res,"DSDT.aml")
