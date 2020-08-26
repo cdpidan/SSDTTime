@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-# 0.0.0
 from Scripts import *
 import getpass, os, tempfile, shutil, plistlib, sys, binascii, zipfile, re, string
 
@@ -20,15 +18,6 @@ class SSDT:
         self.output = "Results"
         self.legacy_irq = ["TMR","TIMR","IPIC","RTC"] # Could add HPET for extra patch-ness, but shouldn't be needed
         self.target_irqs = [0,8,11]
-
-    def find_substring(self, needle, haystack): # partial credits to aronasterling on Stack Overflow
-        index = haystack.find(needle)
-        if index == -1:
-            return False
-        L = index + len(needle)
-        if L < len(haystack) and haystack[L] in string.ascii_uppercase:
-            return False
-        return True
 
     def select_dsdt(self):
         self.u.head("Select DSDT")
@@ -90,7 +79,7 @@ class SSDT:
         return plist_data
     
     def make_plist(self, oc_acpi, cl_acpi, patches):
-        if not len(patches): return # No patches to add - bail
+        # if not len(patches): return # No patches to add - bail
         repeat = False
         print("Building patches_OC and patches_Clover plists...")
         output = self.d.check_output(self.output)
@@ -141,64 +130,78 @@ class SSDT:
         with open(os.path.join(output,"patches_Clover.plist"),"wb") as f:
             plist.dump(cl_plist,f)
 
-    def fake_ec(self):
+    def fake_ec(self, laptop = False):
         rename = False
         if not self.ensure_dsdt():
             return
         self.u.head("Fake EC")
         print("")
-        print("Locating PNP0C09 devices...")
-        ec_list = self.d.get_devices("PNP0C09",strip_comments=True)
-        ec_to_patch = []
+        print("Locating PNP0C09 (EC) devices...")
+        ec_list = self.d.get_device_paths_with_hid("PNP0C09")
+        ec_to_patch  = []
+        patches = []
+        lpc_name = None
         if len(ec_list):
+            lpc_name = ".".join(ec_list[0][0].split(".")[:-1])
             print(" - Got {}".format(len(ec_list)))
             print(" - Validating...")
             for x in ec_list:
-                device = x[0].split("(")[1].split(")")[0].split(".")[-1]
+                device = x[0]
                 print(" --> {}".format(device))
-                scope = "\n".join(self.d.get_scope(x[1]))
+                if device.split(".")[-1] == "EC":
+                    if laptop:
+                        print(" ----> Named EC device located - no fake needed.")
+                        print("")
+                        self.u.grab("Press [enter] to return to main menu...")
+                        return
+                    print(" ----> EC called EC. Renaming")
+                    device = ".".join(device.split(".")[:-1]+["EC0"])
+                    rename = True
+                scope = "\n".join(self.d.get_scope(x[1],strip_comments=True))
                 # We need to check for _HID, _CRS, and _GPE
                 if all((y in scope for y in ["_HID","_CRS","_GPE"])):
                     print(" ----> Valid EC Device")
-                    if device == "EC":
-                        print(" ----> EC called EC. Renaming")
-                        device = "EC0"
-                        rename = True
-                    else:
-                        rename = False
-                    ec_to_patch.append(device)
+                    sta = self.d.get_method_paths(device+"._STA")
+                    if len(sta):
+                        print(" ----> Contains _STA method. Skipping")
+                        continue
+                    if not laptop:
+                        ec_to_patch.append(device)
                 else:
                     print(" ----> NOT Valid EC Device")
         else:
             print(" - None found - only needs a Fake EC device")
         print("Locating LPC(B)/SBRG...")
-        lpc_name = next((x for x in ("LPCB","LPC0","LPC","SBRG") if self.find_substring(x,self.d.dsdt)),None)
+        if lpc_name == None:
+            for x in ("LPCB", "LPC0", "LPC", "SBRG", "PX40"):
+                try:
+                    lpc_name = self.d.get_device_paths(x)[0][0]
+                    break
+                except: pass
         if not lpc_name:
             print(" - Could not locate LPC(B)! Aborting!")
             print("")
             self.u.grab("Press [enter] to return to main menu...")
             return
-        else:
-            print(" - Found {}".format(lpc_name))
+        print(" - Found {}".format(lpc_name))
+        comment = "SSDT-EC"
         if rename == True:
-            patches = [{"Comment":"EC to EC0","Find":"45435f5f","Replace":"4543305f"}]  
-            oc = {"Comment":"SSDT-EC (Needs EC to EC0 rename)","Enabled":True,"Path":"SSDT-EC.aml"}
-        else:
-            patches = ()
-            oc = {"Comment":"SSDT-EC","Enabled":True,"Path":"SSDT-EC.aml"}
+            patches.append({"Comment":"EC to EC0","Find":"45435f5f","Replace":"4543305f"})
+            comment += " (Needs EC to EC0 rename)"
+        oc = {"Comment":comment,"Enabled":True,"Path":"SSDT-EC.aml"}
         self.make_plist(oc, "SSDT-EC.aml", patches)
         print("Creating SSDT-EC...")
         ssdt = """
 DefinitionBlock ("", "SSDT", 2, "CORP ", "SsdtEC", 0x00001000)
 {
-    External (_SB_.PCI0.[[LPCName]], DeviceObj)
+    External ([[LPCName]], DeviceObj)
 """.replace("[[LPCName]]",lpc_name)
         for x in ec_to_patch:
-            ssdt += "    External (_SB_.PCI0.{}.{}, DeviceObj)\n".format(lpc_name,x)
+            ssdt += "    External ({}, DeviceObj)\n".format(x)
         # Walk them again and add the _STAs
         for x in ec_to_patch:
             ssdt += """
-    Scope (\_SB.PCI0.[[LPCName]].[[ECName]])
+    Scope ([[ECName]])
     {
         Method (_STA, 0, NotSerialized)  // _STA: Status
         {
@@ -215,7 +218,7 @@ DefinitionBlock ("", "SSDT", 2, "CORP ", "SsdtEC", 0x00001000)
 """.replace("[[LPCName]]",lpc_name).replace("[[ECName]]",x)
         # Create the faked EC
         ssdt += """
-    Scope (\_SB.PCI0.[[LPCName]])
+    Scope ([[LPCName]])
     {
         Device (EC)
         {
@@ -246,31 +249,23 @@ DefinitionBlock ("", "SSDT", 2, "CORP ", "SsdtEC", 0x00001000)
         self.u.head("Plugin Type")
         print("")
         print("Determining CPU name scheme...")
-        cpu_name = next((x for x in ("CPU0","PR00") if x in self.d.dsdt),None)
+        try: cpu_name = self.d.get_processor_paths("")[0][0]
+        except: cpu_name = None
         if not cpu_name:
-            print(" - Could not locate CPU0 or PR00! Aborting!")
+            print(" - Could not locate Processor object! Aborting!")
             print("")
             self.u.grab("Press [enter] to return to main menu...")
             return
         else:
             print(" - Found {}".format(cpu_name))
-        print("Determining CPU parent name scheme...")
-        cpu_p_name = next((x for x in ("_PR_","_SB_","_PR") if "{}.{}".format(x,cpu_name) in self.d.dsdt),None)
-        if not cpu_p_name:
-            print(" - Could not locate {} parent! Aborting!".format(cpu_name))
-            print("")
-            self.u.grab("Press [enter] to return to main menu...")
-            return
-        else:
-            print(" - Found {}".format(cpu_p_name))
         oc = {"Comment":"Plugin Type","Enabled":True,"Path":"SSDT-PLUG.aml"}
         self.make_plist(oc, "SSDT-PLUG.aml", ())
         print("Creating SSDT-PLUG...")
         ssdt = """
 DefinitionBlock ("", "SSDT", 2, "CORP", "CpuPlug", 0x00003000)
 {
-    External ([[CPUPName]].[[CPUName]], ProcessorObj)
-    Scope (\[[CPUPName]].[[CPUName]])
+    External ([[CPUName]], ProcessorObj)
+    Scope ([[CPUName]])
     {
         Method (DTGP, 5, NotSerialized)
         {
@@ -309,7 +304,7 @@ DefinitionBlock ("", "SSDT", 2, "CORP", "CpuPlug", 0x00003000)
             Return (Local0)
         }
     }
-}""".replace("[[CPUName]]",cpu_name).replace("[[CPUPName]]",cpu_p_name)
+}""".replace("[[CPUName]]",cpu_name)
         self.write_ssdt("SSDT-PLUG",ssdt)
         print("")
         print("Done.")
@@ -523,30 +518,28 @@ DefinitionBlock ("", "SSDT", 2, "CORP", "CpuPlug", 0x00003000)
         print("")
         print("Locating HPET's _CRS Method...")
         devices = self.d.get_devices("Method (_CRS")
-        hpet = None
-        for d in devices:
-            if not "HPET" in d[0]:
-                continue
-            hpet = d
-            break
-        if not hpet:
+        hpet = self.d.get_method_paths("HPET._CRS")
+        hpatch = self.d.get_method_paths("HPET.XCRS")
+        if not len(hpet):
             print(" - Could not locate HPET's _CRS! Aborting!")
+            if len(hpatch):
+                print(" --> Appears to already be named XCRS!")
             print("")
             self.u.grab("Press [enter] to return to main menu...")
             return
-        crs_index = self.d.find_next_hex(hpet[2])[1]
+        crs_index = self.d.find_next_hex(hpet[0][1])[1]
         print(" - Found at index {}".format(crs_index))
         crs  = "5F435253"
         xcrs = "58435253"
-        pad = self.d.get_unique_pad(crs, crs_index)
-        patches = [{"Comment":"HPET _CRS to XCRS Rename","Find":crs+pad,"Replace":xcrs+pad}]
+        padl,padr = self.d.get_shortest_unique_pad(crs, crs_index)
+        patches = [{"Comment":"HPET _CRS to XCRS Rename","Find":padl+crs+padr,"Replace":padl+xcrs+padr}]
         devs = self.list_irqs()
         target_irqs = self.get_irq_choice(devs)
         self.u.head("Creating IRQ Patches")
         print("")
         print(" - HPET _CRS to XCRS Rename:")
-        print("      Find: {}".format(crs+pad))
-        print("   Replace: {}".format(xcrs+pad))
+        print("      Find: {}".format(padl+crs+padr))
+        print("   Replace: {}".format(padl+xcrs+padr))
         print("")
         print("Checking IRQs...")
         print("")
@@ -580,9 +573,9 @@ DefinitionBlock ("", "SSDT", 2, "CORP", "CpuPlug", 0x00003000)
                         })
                     continue
                 ending = "".join(matches[0][1:])
-                pad = self.d.get_unique_pad(t["find"]+ending, t["index"])
-                t_patch = t["find"]+ending+pad
-                r_patch = t["repl"]+ending+pad
+                padl,padr = self.d.get_shortest_unique_pad(t["find"]+ending, t["index"])
+                t_patch = padl+t["find"]+ending+padr
+                r_patch = padl+t["repl"]+ending+padr
                 if not dev in unique_patches:
                     unique_patches[dev] = []
                 unique_patches[dev].append({
@@ -623,29 +616,13 @@ DefinitionBlock ("", "SSDT", 2, "CORP", "CpuPlug", 0x00003000)
         # Restore the original DSDT in memory
         self.d.dsdt_raw = saved_dsdt
         print("Locating HPET...")
-        try:
-            for x in self.d.get_scope(self.d.get_devices("HPET", strip_comments=True)[0][1]):
-                if "HPET." in x:
-                    scope = x
-                    break
-            while scope[:1] != "\\":
-                scope = scope[1:]
-            scope = scope[1:]
-            while scope[-4:] != "HPET":
-                scope = scope[:-1]
-            scope = scope[:-5]
-            if "_SB" == scope:
-                scope = scope.replace("_SB", "_SB_")
-            if scope == "":
-                scope = "HPET"
-                name = scope
-            else:
-                name = scope + ".HPET"
-            print("Location: {}".format(scope))
-        except:
+        hpet = self.d.get_device_paths_with_hid("PNP0103")
+        if not hpet:
             print("HPET could not be located.")
             self.u.grab("Press [enter] to return to main menu...")
-            return     
+            return
+        name  = hpet[0][0]
+        scope = ".".join(name.split(".")[:-1]) 
         oc = {"Comment":"HPET _CRS (Needs _CRS to XCRS Rename)","Enabled":True,"Path":"SSDT-HPET.aml"}
         self.make_plist(oc, "SSDT-HPET.aml", patches)
         print("Creating SSDT-HPET...")
@@ -655,9 +632,9 @@ DefinitionBlock ("", "SSDT", 2, "CORP", "CpuPlug", 0x00003000)
 //
 DefinitionBlock ("", "SSDT", 2, "CORP", "HPET", 0x00000000)
 {
-    External ([[ext]], DeviceObj)    // (from opcode)
+    [[ext]]
     External ([[name]], DeviceObj)    // (from opcode)
-    Name (\[[name]]._CRS, ResourceTemplate ()  // _CRS: Current Resource Settings
+    Name ([[name]]._CRS, ResourceTemplate ()  // _CRS: Current Resource Settings
     {
         IRQNoFlags ()
             {0,8,11}
@@ -667,8 +644,248 @@ DefinitionBlock ("", "SSDT", 2, "CORP", "HPET", 0x00000000)
             )
     })
 }
-""".replace("[[ext]]",scope).replace("[[name]]",name)
+""".replace("[[ext]]","External ({}, DeviceObj)    // (from opcode)".format(scope) if len(scope) else "").replace("[[name]]",name)
         self.write_ssdt("SSDT-HPET",ssdt)
+        print("")
+        print("Done.")
+        print("")
+        self.u.grab("Press [enter] to return...")
+
+    def ssdt_pmc(self):
+        if not self.ensure_dsdt():
+            return
+        self.u.head("SSDT PMC")
+        print("")
+        print("Locating LPC(B)/SBRG...")
+        ec_list = self.d.get_device_paths_with_hid("PNP0C09")
+        lpc_name = None
+        if len(ec_list):
+            lpc_name = ".".join(ec_list[0][0].split(".")[:-1])
+        if lpc_name == None:
+            for x in ("LPCB", "LPC0", "LPC", "SBRG", "PX40"):
+                try:
+                    lpc_name = self.d.get_device_paths(x)[0][0]
+                    break
+                except: pass
+        if not lpc_name:
+            print(" - Could not locate LPC(B)! Aborting!")
+            print("")
+            self.u.grab("Press [enter] to return to main menu...")
+            return
+        print(" - Found {}".format(lpc_name))
+        oc = {"Comment":"PMCR for native 300-series NVRAM","Enabled":True,"Path":"SSDT-PMC.aml"}
+        self.make_plist(oc, "SSDT-PMC.aml", ())
+        print("Creating SSDT-PMC...")
+        ssdt = """//
+// SSDT-PMC source from Acidanthera
+// Original found here: https://github.com/acidanthera/OpenCorePkg/blob/master/Docs/AcpiSamples/SSDT-PMC.dsl
+//
+// Uses the CORP name to denote where this was created for troubleshooting purposes.
+//
+DefinitionBlock ("", "SSDT", 2, "CORP", "PMCR", 0x00001000)
+{
+    External ([[LPCName]], DeviceObj)
+    Scope (_SB.PCI0.LPCB)
+    {
+        Device (PMCR)
+        {
+            Name (_HID, EisaId ("APP9876"))  // _HID: Hardware ID
+            Method (_STA, 0, NotSerialized)  // _STA: Status
+            {
+                If (_OSI ("Darwin"))
+                {
+                    Return (0x0B)
+                }
+                Else
+                {
+                    Return (Zero)
+                }
+            }
+            Name (_CRS, ResourceTemplate ()  // _CRS: Current Resource Settings
+            {
+                Memory32Fixed (ReadWrite,
+                    0xFE000000,         // Address Base
+                    0x00010000,         // Address Length
+                    )
+            })
+        }
+    }
+}""".replace("[[LPCName]]",lpc_name)
+        self.write_ssdt("SSDT-PMC",ssdt)
+        print("")
+        print("Done.")
+        print("")
+        self.u.grab("Press [enter] to return...")
+
+    def ssdt_awac(self):
+        if not self.ensure_dsdt():
+            return
+        self.u.head("SSDT AWAC")
+        print("")
+        print("Locating ACPI000E (AWAC) devices...")
+        awac_list = self.d.get_device_paths_with_hid("ACPI000E")
+        if not len(awac_list):
+            print(" - Could not locate any ACPI000E devices!  SSDT-AWAC not needed!")
+            print("")
+            self.u.grab("Press [enter] to return to main menu...")
+            return
+        awac = awac_list[0]
+        root = awac[0].split(".")[0]
+        print(" - Found {}".format(awac[0]))
+        print(" --> Verifying _STA...")
+        sta  = self.d.get_method_paths(awac[0]+"._STA")
+        xsta = self.d.get_method_paths(awac[0]+".XSTA")
+        has_stas = False
+        lpc_name = None
+        patches = []
+        if not len(sta) and len(xsta):
+            print(" --> _STA already renamed to XSTA!  Aborting!")
+            print("")
+            self.u.grab("Press [enter] to return to main menu...")
+            return
+        if len(sta):
+            scope = "\n".join(self.d.get_scope(sta[0][1],strip_comments=True))
+            if "STAS" in scope:
+                # We have an STAS var, and should be able to just leverage it
+                has_stas = True
+                print(" --> Has STAS variable")
+            else: print(" --> Does NOT have STAS variable")
+        else:
+            print(" --> No _STA method found")
+        # Let's find out of we need a unique patch for _STA -> XSTA
+        if len(sta) and not has_stas:
+            print(" --> Generating _STA to XSTA patch")
+            sta_index = self.d.find_next_hex(sta[0][1])[1]
+            print(" ----> Found at index {}".format(sta_index))
+            sta_hex  = "5F535441"
+            xsta_hex = "58535441"
+            padl,padr = self.d.get_shortest_unique_pad(sta_hex, sta_index)
+            patches.append({"Comment":"AWAC _STA to XSTA Rename","Find":padl+sta_hex+padr,"Replace":padl+xsta_hex+padr})
+        print("Locating PNP0B00 (RTC) devices...")
+        rtc_list  = self.d.get_device_paths_with_hid("PNP0B00")
+        rtc_fake = True
+        if len(rtc_list):
+            rtc_fake = False
+            print(" - Found at {}".format(rtc_list[0][0]))
+        else: print(" - None found - fake needed!")
+        if rtc_fake:
+            print("Locating LPC(B)/SBRG...")
+            ec_list = self.d.get_device_paths_with_hid("PNP0C09")
+            if len(ec_list):
+                lpc_name = ".".join(ec_list[0][0].split(".")[:-1])
+            if lpc_name == None:
+                for x in ("LPCB", "LPC0", "LPC", "SBRG", "PX40"):
+                    try:
+                        lpc_name = self.d.get_device_paths(x)[0][0]
+                        break
+                    except: pass
+            if not lpc_name:
+                print(" - Could not locate LPC(B)! Aborting!")
+                print("")
+                self.u.grab("Press [enter] to return to main menu...")
+                return
+        # At this point - we need to do the following:
+        # 1. Change STAS if needed
+        # 2. Setup _STA with _OSI and call XSTA if needed
+        # 3. Fake RTC if needed
+        oc = {"Comment":"Incompatible AWAC Fix","Enabled":True,"Path":"SSDT-AWAC.aml"}
+        self.make_plist(oc, "SSDT-AWAC.aml", patches)
+        print("Creating SSDT-AWAC...")
+        ssdt = """//
+// SSDT-AWAC source from Acidanthera
+// Originals found here:
+//  - https://github.com/acidanthera/OpenCorePkg/blob/master/Docs/AcpiSamples/SSDT-AWAC.dsl
+//  - https://github.com/acidanthera/OpenCorePkg/blob/master/Docs/AcpiSamples/SSDT-RTC0.dsl
+//
+// Uses the CORP name to denote where this was created for troubleshooting purposes.
+//
+DefinitionBlock ("", "SSDT", 2, "CORP", "AWAC", 0x00000000)
+{
+"""
+        if has_stas:
+            ssdt += """    External (STAS, IntObj)
+    Scope ([[Root]])
+    {
+        Method (_INI, 0, NotSerialized)  // _INI: Initialize
+        {
+            If (_OSI ("Darwin"))
+            {
+                STAS = One
+            }
+        }
+    }
+""".replace("[[Root]]",root)
+        elif len(sta):
+            # We have a renamed _STA -> XSTA method - let's leverage it
+            ssdt += """    External ([[AWACName]], DeviceObj)
+    External ([[AWACName]].XSTA, MethodObj)
+    Scope ([[AWACName]])
+    {
+        Name (ZSTA, 0x0F)
+        Method (_STA, 0, NotSerialized)  // _STA: Status
+        {
+            If (_OSI ("Darwin"))
+            {
+                Return (Zero)
+            }
+            // Default to 0x0F - but return the result of the renamed XSTA if possible
+            If ((CondRefOf ([[AWACName]].XSTA)))
+            {
+                Store ([[AWACName]].XSTA(), ZSTA)
+            }
+            Return (ZSTA)
+        }
+    }
+""".replace("[[AWACName]]",awac[0])
+        else:
+            # No STAS, and no _STA - let's just add one
+            ssdt += """    External ([[AWACName]], DeviceObj)
+    Scope ([[AWACName]])
+    {
+        Method (_STA, 0, NotSerialized)  // _STA: Status
+        {
+            If (_OSI ("Darwin"))
+            {
+                Return (Zero)
+            }
+            Else
+            {
+                Return (0x0F)
+            }
+        }
+    }
+""".replace("[[AWACName]]",awac[0])
+        if rtc_fake:
+            ssdt += """    External ([[LPCName]], DeviceObj)    // (from opcode)
+    Scope ([[LPCName]])
+    {
+        Device (RTC0)
+        {
+            Name (_HID, EisaId ("PNP0B00"))  // _HID: Hardware ID
+            Name (_CRS, ResourceTemplate ()  // _CRS: Current Resource Settings
+            {
+                IO (Decode16,
+                    0x0070,             // Range Minimum
+                    0x0070,             // Range Maximum
+                    0x01,               // Alignment
+                    0x08,               // Length
+                    )
+                IRQNoFlags ()
+                    {8}
+            })
+            Method (_STA, 0, NotSerialized)  // _STA: Status
+            {
+                If (_OSI ("Darwin")) {
+                    Return (0x0F)
+                } Else {
+                    Return (0);
+                }
+            }
+        }
+    }
+""".replace("[[LPCName]]",lpc_name)
+        ssdt += "}"
+        self.write_ssdt("SSDT-AWAC",ssdt)
         print("")
         print("Done.")
         print("")
@@ -680,11 +897,14 @@ DefinitionBlock ("", "SSDT", 2, "CORP", "HPET", 0x00000000)
         print("")
         print("Current DSDT:  {}".format(self.dsdt))
         print("")
-        print("1. FixHPET    - Patch out IRQ Conflicts")
-        print("2. FakeEC     - OS-aware Fake EC")
-        print("3. PluginType - Sets plugin-type = 1 on CPU0/PR00")
+        print("1. FixHPET       - Patch Out IRQ Conflicts")
+        print("2. FakeEC        - OS-Aware Fake EC")
+        print("3. FakeEC Laptop - Only Builds Fake EC - Leaves Existing Untouched")
+        print("4. PluginType    - Sets plugin-type = 1 on First ProcessorObj")
+        print("5. PMC           - Enables Native NVRAM on True 300-Series Boards")
+        print("6. AWAC          - Context-Aware AWAC Disable and RTC Fake")
         if sys.platform.startswith("linux") or sys.platform == "win32":
-            print("4. Dump DSDT  - Automatically dump the system DSDT")
+            print("7. Dump DSDT  - Automatically dump the system DSDT")
         print("")
         print("D. Select DSDT or origin folder")
         print("Q. Quit")
@@ -702,23 +922,23 @@ DefinitionBlock ("", "SSDT", 2, "CORP", "HPET", 0x00000000)
         elif menu == "2":
             self.fake_ec()
         elif menu == "3":
-            self.plugin_type()
+            self.fake_ec(True)
         elif menu == "4":
-            if sys.platform.startswith("linux") or sys.platform == "win32":
-                self.dsdt = self.d.dump_dsdt(os.path.join(os.path.dirname(os.path.realpath(__file__)), self.output))
-            else:
-                return
-
+            self.plugin_type()
+        elif menu == "5":
+            self.ssdt_pmc()
+        elif menu == "6":
+            self.ssdt_awac()
+        elif menu == "7" and (sys.platform.startswith("linux") or sys.platform == "win32"):
+            self.dsdt = self.d.dump_dsdt(os.path.join(os.path.dirname(os.path.realpath(__file__)), self.output))
         return
 
 if __name__ == '__main__':
+    if 2/3 == 0: input = raw_input
     s = SSDT()
     while True:
         try:
             s.main()
         except Exception as e:
             print("An error occurred: {}".format(e))
-            if 2/3 == 0: # Python 2
-                raw_input("Press [enter] to continue...")
-            else:
-                input("Press [enter] to continue...")
+            input("Press [enter] to continue...")
